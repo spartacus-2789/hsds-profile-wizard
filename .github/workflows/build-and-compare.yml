@@ -1,0 +1,160 @@
+name: Build UK Profile and Compare with Reference
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  build-and-compare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Clone UK profile files
+        run: git clone --depth=1 https://github.com/OpenReferralUK/uk-profile.git /tmp/uk-profile
+
+      - name: Set up working directory with profile files
+        run: |
+          mkdir -p work/profile
+          cp -r /tmp/uk-profile/profile/. work/profile/
+          mkdir -p work/.hsds-profile-wizard
+          echo '{}' > work/.hsds-profile-wizard/metadata.json
+          cat > work/profile.json << 'EOF'
+          {
+            "title": "UK HSDS Profile",
+            "description": "The UK profile of HSDS",
+            "base_url": "https://openreferraluk.org/specifications",
+            "openapi_url": "https://openreferraluk.org/specifications/3.0/schema/openapi.json",
+            "version": "3.0",
+            "docs_url": "https://openreferraluk.org",
+            "compile": [
+              "service.json",
+              "organization.json",
+              "location.json",
+              "service_at_location.json"
+            ]
+          }
+          EOF
+
+      - name: Run wizard to generate schemas
+        working-directory: work
+        run: python ../hsds-profile-wizard.py generate --branch "3.0"
+
+      - name: Download reference schemas from openreferraluk.org
+        run: |
+          mkdir -p reference-schemas reference-schemas/compiled
+          shopt -s nullglob
+
+          # Download reference schemas for each file that was generated
+          for gen_file in work/schema/*.json; do
+            filename=$(basename "$gen_file")
+            if curl -sf "https://openreferraluk.org/specifications/3.0/schema/${filename}" \
+                -o "reference-schemas/${filename}"; then
+              echo "Downloaded ${filename}"
+            else
+              echo "WARNING: Could not download ${filename} from reference"
+            fi
+          done
+
+          # Download compiled reference schemas for each compiled file that was generated
+          for gen_file in work/schema/compiled/*.json; do
+            filename=$(basename "$gen_file")
+            if curl -sf "https://openreferraluk.org/specifications/3.0/schema/compiled/${filename}" \
+                -o "reference-schemas/compiled/${filename}"; then
+              echo "Downloaded compiled/${filename}"
+            else
+              echo "WARNING: Could not download compiled/${filename} from reference"
+            fi
+          done
+
+      - name: Compare generated schemas with reference
+        run: |
+          mkdir -p differences differences/compiled
+          shopt -s nullglob
+
+          normalize_json() {
+            jq --sort-keys '.' "$1" 2>/dev/null || cat "$1"
+          }
+
+          compare_file() {
+            local ref_file="$1"
+            local gen_file="$2"
+            local diff_path="$3"
+
+            if [ -f "$gen_file" ]; then
+              diff_output=$(diff <(normalize_json "$ref_file") <(normalize_json "$gen_file") || true)
+              if [ -n "$diff_output" ]; then
+                echo "$diff_output" > "${diff_path}.diff"
+                echo "Differences found in $(basename "$ref_file")"
+              else
+                echo "No differences in $(basename "$ref_file")"
+              fi
+            else
+              echo "$(basename "$ref_file") exists in reference but not in generated output" \
+                > "${diff_path}.missing"
+              echo "Missing in generated output: $(basename "$ref_file")"
+            fi
+          }
+
+          # Compare top-level schemas
+          for ref_file in reference-schemas/*.json; do
+            filename=$(basename "$ref_file")
+            compare_file "$ref_file" "work/schema/${filename}" "differences/${filename}"
+          done
+
+          # Check for generated files not present in reference
+          for gen_file in work/schema/*.json; do
+            filename=$(basename "$gen_file")
+            if [ ! -f "reference-schemas/${filename}" ]; then
+              echo "${filename} exists in generated output but not in reference" \
+                > "differences/${filename}.extra"
+              echo "Extra in generated output (not in reference): ${filename}"
+            fi
+          done
+
+          # Compare compiled schemas
+          for ref_file in reference-schemas/compiled/*.json; do
+            filename=$(basename "$ref_file")
+            compare_file "$ref_file" "work/schema/compiled/${filename}" "differences/compiled/${filename}"
+          done
+
+          # Check for generated compiled files not present in reference
+          for gen_file in work/schema/compiled/*.json; do
+            filename=$(basename "$gen_file")
+            if [ ! -f "reference-schemas/compiled/${filename}" ]; then
+              echo "${filename} exists in generated compiled output but not in reference" \
+                > "differences/compiled/${filename}.extra"
+              echo "Extra in generated compiled output (not in reference): ${filename}"
+            fi
+          done
+
+          echo ""
+          echo "Summary of differences:"
+          if [ -z "$(find differences/ -type f 2>/dev/null | head -1)" ]; then
+            echo "No differences found between generated and reference schemas"
+          else
+            find differences/ -type f | sort
+          fi
+
+      - name: Upload differences as artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: schema-differences
+          path: differences/
+          if-no-files-found: ignore
